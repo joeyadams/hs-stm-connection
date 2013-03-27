@@ -10,7 +10,10 @@ module Control.Concurrent.STM.Connection (
     -- * Connection backends
     HasBackend(..),
     Backend(..),
+
+    -- * Configuration
     Config(..),
+    def,
 
     -- * Exceptions
     ConnException(..),
@@ -28,11 +31,13 @@ data Connection
 
 instance Eq Connection
 
--- | Wrap a connection handle, such as returned by 'Network.connectTo' or
--- 'Network.accept'.  Perform sending and receiving in the background, writing
--- to and reading from channels.  'recv' and 'send' are STM transactions for
--- accessing these channels.
-new :: HasBackend h => h -> IO Connection
+-- | Wrap a connection handle so sending and receiving can be done with
+-- STM transactions.
+new :: HasBackend h
+    => Config -- ^ Limits and timeouts.  Use 'def' for defaults.
+    -> h      -- ^ Connection handle, such as returned by @connectTo@ or
+              --   @accept@ from the network package.
+    -> IO Connection
 new = undefined
 
 -- | Close the connection.  After this, 'recv' and 'send' will fail.
@@ -40,9 +45,9 @@ close :: Connection -> IO ()
 close = undefined
 
 -- | Receive the next chunk of bytes from the connection.
--- Return 'B.empty' on EOF.  Throw an exception if the 'Connection' is closed,
--- or if the underlying 'backendRecv' fails.
-recv :: Connection -> STM ByteString
+-- Return 'Nothing' on EOF, a non-empty string otherwise.  Throw an exception
+-- if the 'Connection' is closed, or if the underlying 'backendRecv' failed.
+recv :: Connection -> STM (Maybe ByteString)
 recv = undefined
 
 -- | Send a chunk of bytes on the connection.  Throw an exception if the
@@ -62,10 +67,9 @@ instance HasBackend Backend where
 
 instance HasBackend Handle where
     getBackend h = return $! Backend
-        { backendRecv   = B.hGetSome h 16384
-        , backendSend   = B.hPut h
-        , backendClose  = hClose h
-        , backendConfig = def
+        { backendRecv  = B.hGetSome h 16384
+        , backendSend  = B.hPut h
+        , backendClose = hClose h
         }
 
 -- |
@@ -82,18 +86,18 @@ data Backend = Backend
     , backendClose :: !(IO ())
       -- ^ Close the connection.  'backendSend' and 'backendRecv' are never
       --   called during or after this.
-    , backendConfig :: !Config
-      -- ^ Configuration parameters (buffer sizes and timeouts).
-      --   'HasBackend' instances will typically use 'def'.
     }
 
+------------------------------------------------------------------------
+-- Configuration
+
 data Config = Config
-    { configRecvBufSize :: !Int
+    { configRecvMaxBytes :: !Int
       -- ^ Default: 16384
       --
       --   Number of bytes that may sit in the receive queue before the
       --   receiving thread blocks.
-    , configSendBufSize :: !Int
+    , configSendMaxBytes :: !Int
       -- ^ Default: 16384
       --
       --   Number of bytes that may sit in the send queue
@@ -119,15 +123,15 @@ data Config = Config
       --   the background, however.
       --
       --   This is useful when 'backendRecv' and 'backendSend' can't be
-      --   interrupted with asynchronous exceptions, as is currently the case
-      --   for network I\/O on Windows.  On other systems, this is usually not
-      --   necessary.
+      --   interrupted with asynchronous exceptions.  This is currently the case
+      --   for network I\/O on Windows; on other systems, this option is
+      --   usually not necessary.
     }
 
 instance Default Config where
     def = Config
-          { configRecvBufSize = 16384
-          , configSendBufSize = 16384
+          { configRecvMaxBytes = 16384
+          , configSendMaxBytes = 16384
           , configRecvTimeout = Nothing
           , configSendTimeout = Nothing
           , configCloseTimeout = Nothing
