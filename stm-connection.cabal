@@ -1,0 +1,40 @@
+name:                stm-connection
+version:             0.1
+synopsis:            Manage a stream connection with STM
+-- description:
+license:             BSD3
+license-file:        LICENSE
+author:              Joey Adams
+maintainer:          joeyadams3.14159@gmail.com
+copyright:           Copyright (c) Joseph Adams 2013
+category:            Data
+build-type:          Simple
+cabal-version:       >=1.8
+homepage:            http://github.com/joeyadams/hs-stm-connection
+bug-reports:         http://github.com/joeyadams/hs-stm-connection/issues
+
+source-repository head
+    type:       git
+    location:   git://github.com/joeyadams/hs-stm-connection.git
+
+library
+    exposed-modules:
+        Control.Concurrent.STM.Connection
+
+    build-depends: base >= 4.4 && < 5
+                 , bytestring
+                 , data-default
+                 , stm >= 2.4
+
+    ghc-options: -Wall -fwarn-tabs
+
+test-suite test
+    type: exitcode-stdio-1.0
+
+    hs-source-dirs: test
+    main-is:        main.hs
+
+    ghc-options: -Wall -fwarn-tabs -fno-warn-missing-signatures
+
+    build-depends: base
+                 , stm-connection
