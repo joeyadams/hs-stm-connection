@@ -16,10 +16,10 @@ module Control.Concurrent.STM.Connection (
 
     -- * Configuration
     Config(..),
-    def,
+    defaultConfig,
 
     -- * Exceptions
-    ConnException(..),
+    ConnectionError(..),
 ) where
 
 import Control.Applicative
@@ -36,15 +36,14 @@ import Data.Typeable (Typeable)
 import System.IO
 
 data Connection = Connection
-    { connOpen      :: !(TVar Bool)
-    , connBackend   :: !Backend
-    , connRecv      :: !(Half RecvState)
-    , connSend      :: !(Half SendState)
-    , connCloseStep :: !(MVar Int)
+    { connState   :: !(TVar ConnState)
+    , connBackend :: !Backend
+    , connRecv    :: !(Half RecvState)
+    , connSend    :: !(Half SendState)
     }
 
 instance Eq Connection where
-    a == b = connOpen a == connOpen b
+    a == b = connState a == connState b
 
 data Half s = Half
     { queue  :: !ByteQueue
@@ -52,6 +51,12 @@ data Half s = Half
     , thread :: !ThreadId
     , done   :: !(TVar Bool)
     }
+
+data ConnState
+  = ConnOpen
+  | ConnClosing
+  | ConnClosed
+  deriving Eq
 
 data RecvState
   = RecvOpen
@@ -79,11 +84,10 @@ new Config{..} h = do
     conn_mv <- newEmptyTMVarIO
     let getConn = atomically $ readTMVar conn_mv
 
-    connOpen      <- newTVarIO True
+    connState     <- newTVarIO ConnOpen
     connBackend   <- getBackend h
     connRecv      <- newHalf RecvOpen configRecvMaxBytes $ getConn >>= recvLoop
     connSend      <- newHalf SendOpen configSendMaxBytes $ getConn >>= sendLoop
-    connCloseStep <- newMVar 1
 
     let !conn = Connection{..}
     atomically $ putTMVar conn_mv conn
@@ -103,18 +107,24 @@ recvLoop Connection{connRecv = Half{..}, ..} =
     loop
   where
     loop = do
-        open <- readTVarIO connOpen
-        when (not open) $ throwIO ThreadKilled
+        -- Test if connection is closed, in case 'close' fails to kill us.
+        -- Shouldn't be necessary, but a silly 'backendClose' might swallow
+        -- 'ThreadKilled' and return successfully.
+        --
+        -- It's okay if we queue bytes after the connection is no longer in the
+        -- 'ConnOpen' state, as 'recv' and 'unRecv' call 'checkOpen'.
+        s <- readTVarIO connState
+        when (s /= ConnOpen) $ throwIO ThreadKilled
 
         res <- try $ backendRecv connBackend
         case res of
             Left ex ->
                   atomically $ writeTVar state $! RecvError ex
-            Right s
-              | B.null s ->
+            Right bs
+              | B.null bs ->
                   atomically $ writeTVar state RecvClosed
               | otherwise -> do
-                  atomically $ BQ.write queue s
+                  atomically $ BQ.write queue bs
                   loop
 
 sendLoop :: Connection -> IO ()
@@ -122,32 +132,50 @@ sendLoop Connection{connSend = Half{..}, ..} =
     loop
   where
     loop = do
-        s <- atomically $ BQ.read queue
+        bs <- atomically $ BQ.read queue `orElse` do
+                  -- Terminate if the queue is exhausted *and* the connection
+                  -- is being closed.
+                  s <- readTVar connState
+                  if s == ConnOpen then retry else throwSTM ThreadKilled
 
-        open <- readTVarIO connOpen
-        when (not open) $ throwIO ThreadKilled
-
-        res <- try $ backendSend connBackend s
+        res <- try $ backendSend connBackend bs
         case res of
             Left ex -> atomically $ writeTVar state $! SendError ex
             Right _ -> loop
 
 -- | Close the connection.  After this, 'recv', 'unRecv', and 'send' will fail.
+--
+-- 'close' will block until all queued data has been sent and the connection
+-- has been closed.  If 'close' is interrupted, it will abandon any data still
+-- sitting in the send queue, and finish closing the connection in the
+-- background.
 close :: Connection -> IO ()
 close Connection{..} =
-  mask $ \restore -> do
-    step <- takeMVar connCloseStep
-    when (step <= 1) $ do
-        atomically $ writeTVar connOpen False
-        _ <- forkIO $ killThread $ thread connRecv
-        _ <- forkIO $ killThread $ thread connSend
-        return ()
-    when (step <= 2) $
-      (`onException` putMVar connCloseStep 2) $ restore $ do
-        waitHalf connRecv
-        waitHalf connSend
-        backendClose connBackend
-    putMVar connCloseStep 3
+  mask_ $
+  join $ atomically $ do
+    s <- readTVar connState
+    case s of
+        ConnOpen -> do
+            writeTVar connState ConnClosing
+            return $ do
+                killHalf connRecv
+                _ <- forkIOWithUnmask $ \unmask ->
+                     (`finally` setClosed) $ unmask $ do
+                         waitHalf connRecv
+                         waitHalf connSend
+                         backendClose connBackend
+                -- Wait for closing to complete, but if interrupted,
+                -- terminate the send thread early.
+                waitClosed `onException` killHalf connSend
+        ConnClosing ->
+            retry
+        ConnClosed ->
+            return $ return ()
+  where
+    waitClosed = atomically $ do
+        s <- readTVar connState
+        if s == ConnClosed then return () else retry
+    setClosed = atomically $ writeTVar connState ConnClosed
 
 waitHalf :: Half s -> IO ()
 waitHalf Half{..} =
@@ -155,10 +183,13 @@ waitHalf Half{..} =
     d <- readTVar done
     if d then return () else retry
 
+killHalf :: Half s -> IO ()
+killHalf = void . forkIO . killThread . thread
+
 checkOpen :: Connection -> STM ()
 checkOpen Connection{..} = do
-    open <- readTVar connOpen
-    when (not open) $ throwSTM ConnClosed
+    s <- readTVar connState
+    when (s /= ConnOpen) $ throwSTM ErrorConnectionClosed
 
 -- | Receive the next chunk of bytes from the connection.
 -- Return 'Nothing' on EOF, a non-empty string otherwise.  Throw an exception
@@ -177,8 +208,8 @@ recv conn@Connection{connRecv = Half{..}, ..} = do
 
 -- | Put some bytes back.  They will be the next bytes returned by 'recv'.
 --
--- This will never block, but it will throw 'ConnClosed' if the connection
--- is closed.
+-- This will never block, but it will throw 'ErrorConnectionClosed' if the
+-- connection is closed.
 unRecv :: Connection -> ByteString -> STM ()
 unRecv conn@Connection{..} bs = do
     checkOpen conn
@@ -245,20 +276,23 @@ data Config = Config
     }
 
 instance Default Config where
-    def = Config
-          { configRecvMaxBytes = 16384
-          , configSendMaxBytes = 16384
-          }
+    def = defaultConfig
+
+defaultConfig :: Config
+defaultConfig = Config
+    { configRecvMaxBytes = 16384
+    , configSendMaxBytes = 16384
+    }
 
 ------------------------------------------------------------------------
 -- Exceptions
 
-data ConnException
-  = ConnClosed      -- ^ connection 'close'd
+data ConnectionError
+  = ErrorConnectionClosed -- ^ connection 'close'd
   deriving Typeable
 
-instance Show ConnException where
+instance Show ConnectionError where
     show err = case err of
-        ConnClosed -> "connection closed"
+        ErrorConnectionClosed -> "connection closed"
 
-instance Exception ConnException
+instance Exception ConnectionError

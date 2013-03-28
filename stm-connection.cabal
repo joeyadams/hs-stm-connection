@@ -40,3 +40,6 @@ test-suite test
 
     build-depends: base
                  , stm-connection
+                 , data-default
+                 , network
+                 , stm
