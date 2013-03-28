@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DoAndIfThenElse #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -35,11 +36,11 @@ import Data.Typeable (Typeable)
 import System.IO
 
 data Connection = Connection
-    { connOpen    :: !(TVar Bool)
-    , connBackend :: !Backend
-    , connRecv    :: !(Half RecvState)
-    , connSend    :: !(Half SendState)
-    , connClose   :: !(IO ())
+    { connOpen      :: !(TVar Bool)
+    , connBackend   :: !Backend
+    , connRecv      :: !(Half RecvState)
+    , connSend      :: !(Half SendState)
+    , connCloseStep :: !(MVar Int)
     }
 
 instance Eq Connection where
@@ -67,12 +68,6 @@ data SendState
   | SendError !SomeException
     -- ^ 'backendSend' failed.
 
-data CloseState
-  = Close0  -- ^ Have not done any closing yet.
-  | Close1  -- ^ Set 'connOpen' to 'False', and forked threads to kill send and
-            --   receive workers.
-  | Close2  -- ^ Called 'backendClose'.
-
 -- | Wrap a connection handle so sending and receiving can be done with
 -- STM transactions.
 new :: HasBackend h
@@ -80,11 +75,32 @@ new :: HasBackend h
     -> h      -- ^ Connection handle, such as returned by @connectTo@ or
               --   @accept@ from the network package.
     -> IO Connection
-new = undefined
+new Config{..} h = do
+    conn_mv <- newEmptyTMVarIO
+    let getConn = atomically $ readTMVar conn_mv
+
+    connOpen      <- newTVarIO True
+    connBackend   <- getBackend h
+    connRecv      <- newHalf RecvOpen configRecvMaxBytes $ getConn >>= recvLoop
+    connSend      <- newHalf SendOpen configSendMaxBytes $ getConn >>= sendLoop
+    connCloseStep <- newMVar 1
+
+    let !conn = Connection{..}
+    atomically $ putTMVar conn_mv conn
+    return conn
+
+newHalf :: s -> Int -> IO () -> IO (Half s)
+newHalf s limit work = do
+    queue  <- BQ.newIO limit
+    state  <- newTVarIO s
+    done   <- newTVarIO False
+    thread <- forkIOWithUnmask $ \unmask ->
+        unmask work `finally` atomically (writeTVar done True)
+    return Half{..}
 
 recvLoop :: Connection -> IO ()
 recvLoop Connection{connRecv = Half{..}, ..} =
-    loop `finally` atomically (writeTVar done True)
+    loop
   where
     loop = do
         open <- readTVarIO connOpen
@@ -103,7 +119,7 @@ recvLoop Connection{connRecv = Half{..}, ..} =
 
 sendLoop :: Connection -> IO ()
 sendLoop Connection{connSend = Half{..}, ..} =
-    loop `finally` atomically (writeTVar done True)
+    loop
   where
     loop = do
         s <- atomically $ BQ.read queue
@@ -118,7 +134,26 @@ sendLoop Connection{connSend = Half{..}, ..} =
 
 -- | Close the connection.  After this, 'recv', 'unRecv', and 'send' will fail.
 close :: Connection -> IO ()
-close = connClose
+close Connection{..} =
+  mask $ \restore -> do
+    step <- takeMVar connCloseStep
+    when (step <= 1) $ do
+        atomically $ writeTVar connOpen False
+        _ <- forkIO $ killThread $ thread connRecv
+        _ <- forkIO $ killThread $ thread connSend
+        return ()
+    when (step <= 2) $
+      (`onException` putMVar connCloseStep 2) $ restore $ do
+        waitHalf connRecv
+        waitHalf connSend
+        backendClose connBackend
+    putMVar connCloseStep 3
+
+waitHalf :: Half s -> IO ()
+waitHalf Half{..} =
+  atomically $ do
+    d <- readTVar done
+    if d then return () else retry
 
 checkOpen :: Connection -> STM ()
 checkOpen Connection{..} = do
