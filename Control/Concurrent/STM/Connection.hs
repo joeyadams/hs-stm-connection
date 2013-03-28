@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DoAndIfThenElse #-}
 {-# LANGUAGE RecordWildCards #-}
 module Control.Concurrent.STM.Connection (
     Connection,
@@ -34,11 +35,21 @@ import Data.Typeable (Typeable)
 import System.IO
 
 data Connection = Connection
-    { connOpen      :: !(TVar Bool)
-    , connRecvQueue :: !ByteQueue
-    , connRecvState :: !(TVar RecvState)
-    , connSendState :: !(TVar SendState)
-    , connClose     :: !(IO ())
+    { connOpen    :: !(TVar Bool)
+    , connBackend :: !Backend
+    , connRecv    :: !(Half RecvState)
+    , connSend    :: !(Half SendState)
+    , connClose   :: !(IO ())
+    }
+
+instance Eq Connection where
+    a == b = connOpen a == connOpen b
+
+data Half s = Half
+    { queue  :: !ByteQueue
+    , state  :: !(TVar s)
+    , thread :: !ThreadId
+    , done   :: !(TVar Bool)
     }
 
 data RecvState
@@ -51,12 +62,16 @@ data RecvState
     --   throw this exception.
 
 data SendState
-  = SendOpen !ByteQueue
-    -- ^ Send thread alive and processing this queue.
+  = SendOpen
+    -- ^ Send thread alive and processing 'connSendQueue'.
   | SendError !SomeException
     -- ^ 'backendSend' failed.
 
-instance Eq Connection
+data CloseState
+  = Close0  -- ^ Have not done any closing yet.
+  | Close1  -- ^ Set 'connOpen' to 'False', and forked threads to kill send and
+            --   receive workers.
+  | Close2  -- ^ Called 'backendClose'.
 
 -- | Wrap a connection handle so sending and receiving can be done with
 -- STM transactions.
@@ -67,14 +82,48 @@ new :: HasBackend h
     -> IO Connection
 new = undefined
 
+recvLoop :: Connection -> IO ()
+recvLoop Connection{connRecv = Half{..}, ..} =
+    loop `finally` atomically (writeTVar done True)
+  where
+    loop = do
+        open <- readTVarIO connOpen
+        when (not open) $ throwIO ThreadKilled
+
+        res <- try $ backendRecv connBackend
+        case res of
+            Left ex ->
+                  atomically $ writeTVar state $! RecvError ex
+            Right s
+              | B.null s ->
+                  atomically $ writeTVar state RecvClosed
+              | otherwise -> do
+                  atomically $ BQ.write queue s
+                  loop
+
+sendLoop :: Connection -> IO ()
+sendLoop Connection{connSend = Half{..}, ..} =
+    loop `finally` atomically (writeTVar done True)
+  where
+    loop = do
+        s <- atomically $ BQ.read queue
+
+        open <- readTVarIO connOpen
+        when (not open) $ throwIO ThreadKilled
+
+        res <- try $ backendSend connBackend s
+        case res of
+            Left ex -> atomically $ writeTVar state $! SendError ex
+            Right _ -> loop
+
 -- | Close the connection.  After this, 'recv', 'unRecv', and 'send' will fail.
 close :: Connection -> IO ()
 close = connClose
 
 checkOpen :: Connection -> STM ()
 checkOpen Connection{..} = do
-    b <- readTVar connOpen
-    if b then return () else throwSTM ConnClosed
+    open <- readTVar connOpen
+    when (not open) $ throwSTM ConnClosed
 
 -- | Receive the next chunk of bytes from the connection.
 -- Return 'Nothing' on EOF, a non-empty string otherwise.  Throw an exception
@@ -82,10 +131,10 @@ checkOpen Connection{..} = do
 --
 -- This will block if no bytes are available right now.
 recv :: Connection -> STM (Maybe ByteString)
-recv conn@Connection{..} = do
+recv conn@Connection{connRecv = Half{..}, ..} = do
     checkOpen conn
-    (Just <$> BQ.read connRecvQueue) `orElse` do
-        s <- readTVar connRecvState
+    (Just <$> BQ.read queue) `orElse` do
+        s <- readTVar state
         case s of
             RecvOpen     -> retry
             RecvClosed   -> return Nothing
@@ -98,19 +147,19 @@ recv conn@Connection{..} = do
 unRecv :: Connection -> ByteString -> STM ()
 unRecv conn@Connection{..} bs = do
     checkOpen conn
-    BQ.unRead connRecvQueue bs
+    BQ.unRead (queue connRecv) bs
 
 -- | Send a chunk of bytes on the connection.  Throw an exception if the
 -- 'Connection' is closed, or if a /previous/ 'backendSend' failed.
 --
 -- This will block if the send queue is full.
 send :: Connection -> ByteString -> STM ()
-send conn@Connection{..} bs = do
+send conn@Connection{connSend = Half{..}, ..} bs = do
     checkOpen conn
-    s <- readTVar connSendState
+    s <- readTVar state
     case s of
-        SendOpen queue -> BQ.write queue bs
-        SendError ex   -> throwSTM ex
+        SendOpen     -> BQ.write queue bs
+        SendError ex -> throwSTM ex
 
 ------------------------------------------------------------------------
 -- Connection backends
