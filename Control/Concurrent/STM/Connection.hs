@@ -5,6 +5,7 @@ module Control.Concurrent.STM.Connection (
     new,
     close,
     recv,
+    unRecv,
     send,
 
     -- * Connection backends
@@ -24,6 +25,8 @@ import Control.Exception
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import Data.Default
+import Data.STM.ByteQueue (ByteQueue)
+import qualified Data.STM.ByteQueue as ByteQueue
 import Data.Typeable (Typeable)
 import System.IO
 
@@ -49,6 +52,10 @@ close = undefined
 -- if the 'Connection' is closed, or if the underlying 'backendRecv' failed.
 recv :: Connection -> STM (Maybe ByteString)
 recv = undefined
+
+-- | Put some bytes back.  They will be the next bytes returned by 'recv'.
+unRecv :: Connection -> ByteString -> STM ()
+unRecv = undefined
 
 -- | Send a chunk of bytes on the connection.  Throw an exception if the
 -- 'Connection' is closed, or if a /previous/ 'backendSend' failed.
@@ -100,10 +107,7 @@ data Config = Config
     , configSendMaxBytes :: !Int
       -- ^ Default: 16384
       --
-      --   Number of bytes that may sit in the send queue
-      --   before 'send' blocks.  This limit will be exceeded if 'send' is called
-      --   with a chunk larger than this, to avoid blocking indefinitely.
-
+      --   Number of bytes that may sit in the send queue before 'send' blocks.
     , configRecvTimeout :: !(Maybe Int)
       -- ^ Default: 'Nothing'
       --

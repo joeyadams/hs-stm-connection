@@ -20,6 +20,8 @@ source-repository head
 library
     exposed-modules:
         Control.Concurrent.STM.Connection
+    other-modules:
+        Data.STM.ByteQueue
 
     build-depends: base >= 4.4 && < 5
                  , bytestring
