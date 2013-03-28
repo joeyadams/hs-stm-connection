@@ -1,5 +1,5 @@
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE EmptyDataDecls #-}
+{-# LANGUAGE RecordWildCards #-}
 module Control.Concurrent.STM.Connection (
     Connection,
     new,
@@ -20,17 +20,41 @@ module Control.Concurrent.STM.Connection (
     ConnException(..),
 ) where
 
+import Control.Applicative
+import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Exception
+import Control.Monad
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import Data.Default
 import Data.STM.ByteQueue (ByteQueue)
-import qualified Data.STM.ByteQueue as ByteQueue
+import qualified Data.STM.ByteQueue as BQ
 import Data.Typeable (Typeable)
 import System.IO
 
-data Connection
+data Connection = Connection
+    { connOpen      :: !(TVar Bool)
+    , connRecvQueue :: !ByteQueue
+    , connRecvState :: !(TVar RecvState)
+    , connSendState :: !(TVar SendState)
+    , connClose     :: !(IO ())
+    }
+
+data RecvState
+  = RecvOpen
+    -- ^ More bytes may appear in 'connRecvQueue'.
+  | RecvClosed
+    -- ^ Received EOF.  After 'connRecvQueue' is exhausted, no more bytes left.
+  | RecvError !SomeException
+    -- ^ 'backendRecv' failed.  After 'connRecvQueue' is exhausted,
+    --   throw this exception.
+
+data SendState
+  = SendOpen !ByteQueue
+    -- ^ Send thread alive and processing this queue.
+  | SendError !SomeException
+    -- ^ 'backendSend' failed.
 
 instance Eq Connection
 
@@ -43,24 +67,50 @@ new :: HasBackend h
     -> IO Connection
 new = undefined
 
--- | Close the connection.  After this, 'recv' and 'send' will fail.
+-- | Close the connection.  After this, 'recv', 'unRecv', and 'send' will fail.
 close :: Connection -> IO ()
-close = undefined
+close = connClose
+
+checkOpen :: Connection -> STM ()
+checkOpen Connection{..} = do
+    b <- readTVar connOpen
+    if b then return () else throwSTM ConnClosed
 
 -- | Receive the next chunk of bytes from the connection.
 -- Return 'Nothing' on EOF, a non-empty string otherwise.  Throw an exception
 -- if the 'Connection' is closed, or if the underlying 'backendRecv' failed.
+--
+-- This will block if no bytes are available right now.
 recv :: Connection -> STM (Maybe ByteString)
-recv = undefined
+recv conn@Connection{..} = do
+    checkOpen conn
+    (Just <$> BQ.read connRecvQueue) `orElse` do
+        s <- readTVar connRecvState
+        case s of
+            RecvOpen     -> retry
+            RecvClosed   -> return Nothing
+            RecvError ex -> throwSTM ex
 
 -- | Put some bytes back.  They will be the next bytes returned by 'recv'.
+--
+-- This will never block, but it will throw 'ConnClosed' if the connection
+-- is closed.
 unRecv :: Connection -> ByteString -> STM ()
-unRecv = undefined
+unRecv conn@Connection{..} bs = do
+    checkOpen conn
+    BQ.unRead connRecvQueue bs
 
 -- | Send a chunk of bytes on the connection.  Throw an exception if the
 -- 'Connection' is closed, or if a /previous/ 'backendSend' failed.
+--
+-- This will block if the send queue is full.
 send :: Connection -> ByteString -> STM ()
-send = undefined
+send conn@Connection{..} bs = do
+    checkOpen conn
+    s <- readTVar connSendState
+    case s of
+        SendOpen queue -> BQ.write queue bs
+        SendError ex   -> throwSTM ex
 
 ------------------------------------------------------------------------
 -- Connection backends
@@ -159,3 +209,23 @@ instance Show ConnException where
         ConnCloseTimeout -> "close timed out"
 
 instance Exception ConnException
+
+------------------------------------------------------------------------
+-- Utilities
+
+-- | Like 'System.Timeout.timeout', but:
+--
+--  * Throw the given exception if the action takes too long,
+--    instead of returning 'Nothing'.
+--
+--  * Don't treat negative interval as \"wait indefinitely\".
+--
+-- The usual caveats of "System.Timeout" apply.  In particular, timing out
+-- network I/O will not work on Windows unless you set a socket timeout first.
+timeoutThrow :: Exception e => e -> Int -> IO a -> IO a
+timeoutThrow ex usec io = do
+    tid <- myThreadId
+    bracket (forkIOWithUnmask $ \unmask ->
+                 unmask $ threadDelay usec >> throwTo tid ex)
+            killThread
+            (\_ -> io)
