@@ -61,7 +61,7 @@ instance Eq Connection
 -- | Wrap a connection handle so sending and receiving can be done with
 -- STM transactions.
 new :: HasBackend h
-    => Config -- ^ Limits and timeouts.  Use 'def' for defaults.
+    => Config -- ^ Queue size limits.  Use 'def' for defaults.
     -> h      -- ^ Connection handle, such as returned by @connectTo@ or
               --   @accept@ from the network package.
     -> IO Connection
@@ -158,74 +158,23 @@ data Config = Config
       -- ^ Default: 16384
       --
       --   Number of bytes that may sit in the send queue before 'send' blocks.
-    , configRecvTimeout :: !(Maybe Int)
-      -- ^ Default: 'Nothing'
-      --
-      --   Number of microseconds a 'backendRecv' may take before timing out.
-      --   If 'backendRecv' times out, 'recv' will throw 'ConnRecvTimeout'.
-    , configSendTimeout :: !(Maybe Int)
-      -- ^ Default: 'Nothing'
-      --
-      --   Number of microseconds a 'backendSend' may take before timing out.
-      --   If 'backendSend' times out, subsequent 'send' calls will throw
-      --   'ConnSendTimeout'.
-    , configCloseTimeout :: !(Maybe Int)
-      -- ^ Default: 'Nothing'
-      --
-      --   Number of microseconds 'close' will wait before giving up and
-      --   throwing 'ConnCloseTimeout'.  The closing process will continue in
-      --   the background, however.
-      --
-      --   This is useful when 'backendRecv' and 'backendSend' can't be
-      --   interrupted with asynchronous exceptions.  This is currently the case
-      --   for network I\/O on Windows; on other systems, this option is
-      --   usually not necessary.
     }
 
 instance Default Config where
     def = Config
           { configRecvMaxBytes = 16384
           , configSendMaxBytes = 16384
-          , configRecvTimeout = Nothing
-          , configSendTimeout = Nothing
-          , configCloseTimeout = Nothing
           }
 
 ------------------------------------------------------------------------
 -- Exceptions
 
 data ConnException
-  = ConnClosed        -- ^ connection 'close'd
-  | ConnRecvTimeout   -- ^ 'recv' timed out
-  | ConnSendTimeout   -- ^ 'send' timed out
-  | ConnCloseTimeout  -- ^ 'close' timed out
+  = ConnClosed      -- ^ connection 'close'd
   deriving Typeable
 
 instance Show ConnException where
     show err = case err of
-        ConnClosed       -> "connection closed"
-        ConnRecvTimeout  -> "recv timed out"
-        ConnSendTimeout  -> "send timed out"
-        ConnCloseTimeout -> "close timed out"
+        ConnClosed -> "connection closed"
 
 instance Exception ConnException
-
-------------------------------------------------------------------------
--- Utilities
-
--- | Like 'System.Timeout.timeout', but:
---
---  * Throw the given exception if the action takes too long,
---    instead of returning 'Nothing'.
---
---  * Don't treat negative interval as \"wait indefinitely\".
---
--- The usual caveats of "System.Timeout" apply.  In particular, timing out
--- network I/O will not work on Windows unless you set a socket timeout first.
-timeoutThrow :: Exception e => e -> Int -> IO a -> IO a
-timeoutThrow ex usec io = do
-    tid <- myThreadId
-    bracket (forkIOWithUnmask $ \unmask ->
-                 unmask $ threadDelay usec >> throwTo tid ex)
-            killThread
-            (\_ -> io)
