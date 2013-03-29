@@ -9,6 +9,8 @@ module Control.Concurrent.STM.Connection (
     recv,
     unRecv,
     send,
+    sendCram,
+    isSendQueueEmpty,
 
     -- * Connection backends
     HasBackend(..),
@@ -200,13 +202,16 @@ recv :: Connection -> STM (Maybe ByteString)
 recv conn@Connection{connRecv = Half{..}, ..} = do
     checkOpen conn
     (Just <$> BQ.read queue) `orElse` do
+        -- Read from the queue *first*.  Don't report EOF or error until all
+        -- bytes in the queue are consumed.
         s <- readTVar state
         case s of
             RecvOpen     -> retry
             RecvClosed   -> return Nothing
             RecvError ex -> throwSTM ex
 
--- | Put some bytes back.  They will be the next bytes returned by 'recv'.
+-- | Put some bytes back.  These will be the next bytes returned by 'recv',
+-- even if 'recv' previously reported EOF or error.
 --
 -- This will never block, but it will throw 'ErrorConnectionClosed' if the
 -- connection is closed.
@@ -220,11 +225,25 @@ unRecv conn@Connection{..} bs = do
 --
 -- This will block if the send queue is full.
 send :: Connection -> ByteString -> STM ()
-send conn@Connection{connSend = Half{..}, ..} bs = do
+send conn bs = withSendQueue conn $ \q -> BQ.write q bs
+
+-- | Like 'send', but never block, even if this causes the send queue to exceed
+-- 'configSendMaxBytes'.
+sendCram :: Connection -> ByteString -> STM ()
+sendCram conn bs = withSendQueue conn $ \q -> BQ.cram q bs
+
+-- | Test if the send queue is empty.  This is useful when sending dummy
+-- messages to keep the connection alive, to avoid queuing such messages when
+-- the connection is already congested with messages to send.
+isSendQueueEmpty :: Connection -> STM Bool
+isSendQueueEmpty conn = withSendQueue conn BQ.isEmpty
+
+withSendQueue :: Connection -> (ByteQueue -> STM a) -> STM a
+withSendQueue conn@Connection{connSend = Half{..}, ..} cb = do
     checkOpen conn
     s <- readTVar state
     case s of
-        SendOpen     -> BQ.write queue bs
+        SendOpen     -> cb queue
         SendError ex -> throwSTM ex
 
 ------------------------------------------------------------------------

@@ -7,6 +7,8 @@ module Data.STM.ByteQueue (
     read,
     unRead,
     write,
+    cram,
+    isEmpty,
 ) where
 
 import Control.Concurrent.STM
@@ -69,3 +71,15 @@ write ByteQueue{..} s
           writeTVar bytes n'
       else
           retry
+
+-- | Like 'write', but proceed even if the queue limit is exceeded.
+cram :: ByteQueue -> ByteString -> STM ()
+cram ByteQueue{..} s
+  | B.null s = return ()
+  | otherwise = do
+      writeTChan chan s
+      modifyTVar' bytes (\n -> n + B.length s)
+
+-- | Return 'True' if the queue is empty, meaning 'read' would block.
+isEmpty :: ByteQueue -> STM Bool
+isEmpty = isEmptyTChan . chan
