@@ -21,7 +21,7 @@ library
     exposed-modules:
         Control.Concurrent.STM.Connection
     other-modules:
-        Data.STM.ByteQueue
+        Data.STM.Queue
 
     build-depends: base >= 4.4 && < 5
                  , bytestring

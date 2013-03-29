@@ -1,85 +1,79 @@
 {-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE DoAndIfThenElse #-}
 {-# LANGUAGE RecordWildCards #-}
-module Data.STM.ByteQueue (
-    ByteQueue,
+module Data.STM.Queue (
+    Queue,
     newIO,
     read,
-    unRead,
     write,
     cram,
     isEmpty,
 ) where
 
 import Control.Concurrent.STM
-import Data.ByteString (ByteString)
-import qualified Data.ByteString as B
 import Prelude hiding (read)
 
-data ByteQueue = ByteQueue
-    { chan  :: !(TChan ByteString)
-    , bytes :: !(TVar Int)
-      -- ^ Number of bytes currently in the queue.
+data Queue a = Queue
+    { chan  :: !(TChan a)
+    , count :: !(TVar Int)
+      -- ^ Number of items currently in the queue.
     , limit :: !Int
-      -- ^ Loosely-enforced limit on number of bytes in the queue.
+      -- ^ Loosely-enforced limit on number of items in the queue.
+      --   Use 'maxBound' for \"no limit\".
     }
     -- ^ Invariants:
     --
-    --  * bytes == sum (map B.length chan)
-    --
-    --  * No chunks in 'chan' are empty.
+    --  * count == length chan
     --
     --  * limit >= 0
 
-instance Eq ByteQueue where
-    (==) a b = chan a == chan b
+instance Eq (Queue a) where
+    a == b = chan a == chan b
 
-newIO :: Int  -- ^ Limit on number of bytes in queue
-      -> IO ByteQueue
-newIO n = do
+newIO :: Maybe Int
+         -- ^ Limit on number of items in queue.  'Nothing' means no limit.
+      -> IO (Queue a)
+newIO mlimit = do
     chan  <- newTChanIO
-    bytes <- newTVarIO 0
-    return $! ByteQueue{limit = max 0 n, ..}
+    count <- newTVarIO 0
+    let !limit = maybe maxBound (max 0) mlimit
+    return $! Queue{..}
 
--- | Read a chunk of bytes from the queue.
-read :: ByteQueue -> STM ByteString
-read ByteQueue{..} = do
-    s <- readTChan chan
-    modifyTVar' bytes (\n -> n - B.length s)
-    return s
+dec :: TVar Int -> STM ()
+dec var = do
+    n <- readTVar var
+    writeTVar var $! n-1
 
--- | Put some bytes back.  They will be the next bytes read.
--- This will never block.
-unRead :: ByteQueue -> ByteString -> STM ()
-unRead ByteQueue{..} s
-  | B.null s = return ()
-  | otherwise = do
-      unGetTChan chan s
-      modifyTVar' bytes (\n -> n + B.length s)
+inc :: TVar Int -> STM ()
+inc var = do
+    n <- readTVar var
+    writeTVar var $! n+1
 
--- | Write some bytes to the queue.  Block if the queue is full.
-write :: ByteQueue -> ByteString -> STM ()
-write ByteQueue{..} s
-  | B.null s = return ()
-  | otherwise = do
-      n <- readTVar bytes
-      let !n' = n + B.length s
-      -- Write item if channel is empty or if item does not exceed the limit.
-      -- Otherwise, wait.
-      if n <= 0 || n' <= limit then do
-          writeTChan chan s
-          writeTVar bytes n'
-      else
-          retry
+incLimit :: TVar Int -> Int -> STM ()
+incLimit var limit = do
+    n <- readTVar var
+    if n < limit
+        then writeTVar var $! n+1
+        else retry
+
+-- | Read an item from the queue.
+read :: Queue a -> STM a
+read Queue{..} = do
+    a <- readTChan chan
+    dec count
+    return a
+
+-- | Write an item to the queue.  Block if the queue is full.
+write :: Queue a -> a -> STM ()
+write Queue{..} a = do
+    incLimit count limit
+    writeTChan chan a
 
 -- | Like 'write', but proceed even if the queue limit is exceeded.
-cram :: ByteQueue -> ByteString -> STM ()
-cram ByteQueue{..} s
-  | B.null s = return ()
-  | otherwise = do
-      writeTChan chan s
-      modifyTVar' bytes (\n -> n + B.length s)
+cram :: Queue a -> a -> STM ()
+cram Queue{..} a = do
+    inc count
+    writeTChan chan a
 
 -- | Return 'True' if the queue is empty, meaning 'read' would block.
-isEmpty :: ByteQueue -> STM Bool
+isEmpty :: Queue a -> STM Bool
 isEmpty = isEmptyTChan . chan
