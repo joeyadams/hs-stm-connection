@@ -5,9 +5,9 @@ module Data.STM.Queue (
     newIO,
     close,
     read,
+    isEmpty,
     write,
     cram,
-    isEmpty,
 ) where
 
 import Control.Applicative
@@ -42,17 +42,23 @@ newIO mlimit = do
     closed <- newTVarIO Nothing
     return $! Queue{..}
 
+whenOpen :: Queue t a -> STM b -> STM (Either t b)
+whenOpen Queue{..} onOpen = do
+    m <- readTVar closed
+    case m of
+        Nothing -> Right <$> onOpen
+        Just t  -> return $ Left t
+
 -- | Close the 'Queue' with the given terminator value.  No more items may be
 -- queued after this, but items still in the queue may be read.
 --
--- Calling 'close' again will have no effect, even if a different terminator
--- value is given.
-close :: Queue t a -> t -> STM ()
-close Queue{..} t = do
-    c <- readTVar closed
-    case c of
-        Nothing -> writeTVar closed $ Just t
-        Just _  -> return ()
+-- If 'close' has already been called, return 'Left' with the old terminator
+-- value.  All of the 'Queue' accessors signal failure this way.
+-- With the exception of 'read' and 'isEmpty', accessors will always return
+-- 'Left' after 'close' has been called.
+close :: Queue t a -> t -> STM (Either t ())
+close q@Queue{..} t =
+    whenOpen q $ writeTVar closed $ Just t
 
 dec :: TVar Int -> STM ()
 dec var = do
@@ -71,13 +77,6 @@ incLimit var limit = do
         then writeTVar var $! n+1
         else retry
 
-whenOpen :: Queue t a -> STM b -> STM (Either t b)
-whenOpen Queue{..} onOpen = do
-    m <- readTVar closed
-    case m of
-        Nothing -> Right <$> onOpen
-        Just t  -> return $ Left t
-
 -- | Read an item from the queue.  Return 'Left' if the queue is 'close'd and
 -- all items have been read out of it.
 read :: Queue t a -> STM (Either t a)
@@ -88,6 +87,15 @@ read q@Queue{..} = do
         Just a -> do
             dec count
             return $ Right a
+
+-- | Return @'Right' 'True'@ if the queue is empty, meaning 'read' would block.
+-- Return 'Left' if the queue is closed and no more items are left.
+isEmpty :: Queue t a -> STM (Either t Bool)
+isEmpty q@Queue{..} = do
+    e <- isEmptyTChan chan
+    if e
+        then whenOpen q $ return True
+        else return $ Right False
 
 -- | Write an item to the queue.  Block if the queue is full.
 -- Return 'Left' if the queue is 'close'd.
@@ -103,12 +111,3 @@ cram q@Queue{..} a =
     whenOpen q $ do
         inc count
         writeTChan chan a
-
--- | Return 'True' if the queue is empty, meaning 'read' would block.
--- Return 'Left' if the queue is closed and no more items are left.
-isEmpty :: Queue t a -> STM (Either t Bool)
-isEmpty q@Queue{..} = do
-    e <- isEmptyTChan chan
-    if e
-        then whenOpen q $ return True
-        else return $ Right False
