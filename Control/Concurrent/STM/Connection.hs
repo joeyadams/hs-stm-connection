@@ -33,20 +33,23 @@ import qualified Data.STM.Queue as Q
 import Data.Typeable (Typeable)
 
 data Connection r s = Connection
-    { connState   :: !(TVar ConnState)
+    { connOpen    :: !(TVar Bool)
+      -- ^ If 'True', the connection has not been 'close'd yet.
+      --   If 'False', accessing the connection will throw
+      --   'ErrorConnectionClosed'.
     , connBackend :: !(Backend r s)
     , connRecv    :: !(Half r)
     , connSend    :: !(Half s)
+    , connDone    :: !(TVar Bool)
+      -- ^ If 'True', the connection is done being used and the backend is done
+      --   being closed.
+      --
+      --   This does not imply that 'connOpen' is 'False'.  Both 'connOpen' and
+      --   'connDone' will be 'True' if the connection is closed automatically.
     }
 
 instance Eq (Connection r s) where
-    a == b = connState a == connState b
-
-data ConnState
-  = ConnOpen
-  | ConnClosing
-  | ConnClosed
-  deriving Eq
+    a == b = connOpen a == connOpen b
 
 data Half a = Half
     { queue  :: !(Queue HalfTerminator a)
@@ -63,13 +66,23 @@ data HalfTerminator
 new :: Config       -- ^ Queue size limits.  Use 'defaultConfig' for defaults.
     -> Backend r s  -- ^ Callbacks for accessing the underlying device.
     -> IO (Connection r s)
-new Config{..} connBackend = do
+new Config{..} connBackend =
+  mask_ $ do
     conn_mv <- newEmptyTMVarIO
     let getConn = atomically $ readTMVar conn_mv
 
-    connState <- newTVarIO ConnOpen
-    connRecv  <- newHalf configRecvLimit $ getConn >>= recvLoop
-    connSend  <- newHalf configSendLimit $ getConn >>= sendLoop
+    connOpen <- newTVarIO True
+    connRecv <- newHalf configRecvLimit $ getConn >>= recvLoop
+    connSend <- newHalf configSendLimit $ getConn >>= sendLoop
+    connDone <- newTVarIO False
+
+    -- Automatically close the backend when we are done using it.
+    _ <- forkIOWithUnmask $ \unmask ->
+         (`finally` atomically (writeTVar connDone True)) $
+         unmask $ do
+             waitHalf connRecv
+             waitHalf connSend
+             backendClose connBackend
 
     let !conn = Connection{..}
     atomically $ putTMVar conn_mv conn
@@ -85,6 +98,15 @@ newHalf limit work = do
             _ <- Q.close queue t
             writeTVar done True
     return Half{..}
+
+waitHalf :: Half a -> IO ()
+waitHalf Half{..} =
+  atomically $ do
+    d <- readTVar done
+    if d then return () else retry
+
+killHalf :: Half a -> IO ()
+killHalf = void . forkIO . killThread . thread
 
 recvLoop :: Connection r s -> IO HalfTerminator
 recvLoop Connection{connRecv = Half{..}, connBackend = Backend{..}} =
@@ -124,45 +146,39 @@ close :: Connection r s -> IO ()
 close Connection{..} =
   mask_ $
   join $ atomically $ do
-    s <- readTVar connState
-    case s of
-        ConnOpen -> do
-            writeTVar connState ConnClosing
-            _ <- Q.close (queue connRecv) $ HTError $ toException ThreadKilled
-            _ <- Q.close (queue connSend) $ HTError $ toException ThreadKilled
-            return $ do
-                killHalf connRecv
-                _ <- forkIOWithUnmask $ \unmask ->
-                     (`finally` setClosed) $ unmask $ do
-                         waitHalf connRecv
-                         waitHalf connSend
-                         backendClose connBackend
-                -- Wait for closing to complete, but if interrupted,
-                -- terminate the send thread early.
-                waitClosed `onException` killHalf connSend
-        ConnClosing ->
-            retry
-        ConnClosed ->
-            return $ return ()
+    b <- readTVar connOpen
+    if b then do
+        -- Mark the connection as closed so subsequent accesses to the
+        -- 'Connection' object will fail.
+        writeTVar connOpen False
+
+        -- Close the recv and send queues.
+        --
+        --  * The recv thread will terminate when it tries to queue a message.
+        --
+        --  * The send thread will terminate *after* consuming remaining data
+        --    in the send queue.
+        _ <- Q.close (queue connRecv) $ HTError $ toException ThreadKilled
+        _ <- Q.close (queue connSend) $ HTError $ toException ThreadKilled
+
+        return $ do
+            -- Kill the receive thread now, but let any pending sends
+            -- flush out.  Wait for closing to complete, but if interrupted,
+            -- terminate the send thread early.
+            killHalf connRecv
+            waitDone `onException` killHalf connSend
+    else
+        -- Connection already being closed.  Wait for it to finish closing.
+        return waitDone
   where
-    waitClosed = atomically $ do
-        s <- readTVar connState
-        if s == ConnClosed then return () else retry
-    setClosed = atomically $ writeTVar connState ConnClosed
-
-waitHalf :: Half a -> IO ()
-waitHalf Half{..} =
-  atomically $ do
-    d <- readTVar done
-    if d then return () else retry
-
-killHalf :: Half a -> IO ()
-killHalf = void . forkIO . killThread . thread
+    waitDone = atomically $ do
+        d <- readTVar connDone
+        if d then return () else retry
 
 checkOpen :: Connection r s -> String -> STM ()
 checkOpen Connection{..} loc = do
-    s <- readTVar connState
-    when (s /= ConnOpen) $ throwSTM $ ErrorConnectionClosed loc
+    b <- readTVar connOpen
+    when (not b) $ throwSTM $ ErrorConnectionClosed loc
 
 -- | Receive the next message from the connection.  Return 'Nothing' on EOF.
 -- Throw an exception if the 'Connection' is closed, or if the underlying
@@ -254,6 +270,9 @@ data Backend r s = Backend
     , backendClose :: !(IO ())
       -- ^ Close the device.  'backendSend' and 'backendRecv' are never
       --   called during or after this.
+      --
+      --   'backendClose' is called when the 'Connection' is done using the
+      --   device, even if you don't use 'close'.
     }
 
 ------------------------------------------------------------------------
