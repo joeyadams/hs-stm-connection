@@ -7,13 +7,12 @@ module Control.Concurrent.STM.Connection (
     new,
     close,
     recv,
-    unRecv,
     send,
-    sendCram,
+    cram,
     isSendQueueEmpty,
+    bye,
 
-    -- * Connection backends
-    HasBackend(..),
+    -- * Connection backend
     Backend(..),
 
     -- * Configuration
@@ -21,38 +20,27 @@ module Control.Concurrent.STM.Connection (
     defaultConfig,
 
     -- * Exceptions
-    ConnectionError(..),
+    Error(..),
 ) where
 
-import Control.Applicative
 import Control.Concurrent
 import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
-import Data.ByteString (ByteString)
-import qualified Data.ByteString as B
 import Data.Default
-import Data.STM.ByteQueue (ByteQueue)
-import qualified Data.STM.ByteQueue as BQ
+import Data.STM.Queue (Queue)
+import qualified Data.STM.Queue as Q
 import Data.Typeable (Typeable)
-import System.IO
 
-data Connection = Connection
+data Connection r s = Connection
     { connState   :: !(TVar ConnState)
-    , connBackend :: !Backend
-    , connRecv    :: !(Half RecvState)
-    , connSend    :: !(Half SendState)
+    , connBackend :: !(Backend r s)
+    , connRecv    :: !(Half r)
+    , connSend    :: !(Half s)
     }
 
-instance Eq Connection where
+instance Eq (Connection r s) where
     a == b = connState a == connState b
-
-data Half s = Half
-    { queue  :: !ByteQueue
-    , state  :: !(TVar s)
-    , thread :: !ThreadId
-    , done   :: !(TVar Bool)
-    }
 
 data ConnState
   = ConnOpen
@@ -60,98 +48,80 @@ data ConnState
   | ConnClosed
   deriving Eq
 
-data RecvState
-  = RecvOpen
-    -- ^ More bytes may appear in 'connRecvQueue'.
-  | RecvClosed
-    -- ^ Received EOF.  After 'connRecvQueue' is exhausted, no more bytes left.
-  | RecvError !SomeException
-    -- ^ 'backendRecv' failed.  After 'connRecvQueue' is exhausted,
-    --   throw this exception.
+data Half a = Half
+    { queue  :: !(Queue HalfTerminator a)
+    , done   :: !(TVar Bool)
+    , thread :: !ThreadId
+    }
 
-data SendState
-  = SendOpen
-    -- ^ Send thread alive and processing 'connSendQueue'.
-  | SendError !SomeException
-    -- ^ 'backendSend' failed.
+data HalfTerminator
+  = HTEOF
+  | HTConnClosed
+  | HTError !SomeException
 
 -- | Wrap a connection handle so sending and receiving can be done with
 -- STM transactions.
-new :: HasBackend h
-    => Config -- ^ Queue size limits.  Use 'def' for defaults.
-    -> h      -- ^ Connection handle, such as returned by @connectTo@ or
-              --   @accept@ from the network package.
-    -> IO Connection
-new Config{..} h = do
+new :: Config       -- ^ Queue size limits.  Use 'defaultConfig' for defaults.
+    -> Backend r s  -- ^ Callbacks for accessing the underlying device.
+    -> IO (Connection r s)
+new Config{..} connBackend = do
     conn_mv <- newEmptyTMVarIO
     let getConn = atomically $ readTMVar conn_mv
 
-    connState     <- newTVarIO ConnOpen
-    connBackend   <- getBackend h
-    connRecv      <- newHalf RecvOpen configRecvMaxBytes $ getConn >>= recvLoop
-    connSend      <- newHalf SendOpen configSendMaxBytes $ getConn >>= sendLoop
+    connState <- newTVarIO ConnOpen
+    connRecv  <- newHalf configRecvLimit $ getConn >>= recvLoop
+    connSend  <- newHalf configSendLimit $ getConn >>= sendLoop
 
     let !conn = Connection{..}
     atomically $ putTMVar conn_mv conn
     return conn
 
-newHalf :: s -> Int -> IO () -> IO (Half s)
-newHalf s limit work = do
-    queue  <- BQ.newIO limit
-    state  <- newTVarIO s
+newHalf :: Maybe Int -> IO HalfTerminator -> IO (Half a)
+newHalf limit work = do
+    queue  <- Q.newIO limit
     done   <- newTVarIO False
-    thread <- forkIOWithUnmask $ \unmask ->
-        unmask work `finally` atomically (writeTVar done True)
+    thread <- forkIOWithUnmask $ \unmask -> do
+        t <- unmask work `catch` (return . HTError)
+        atomically $ do
+            _ <- Q.close queue t
+            writeTVar done True
     return Half{..}
 
-recvLoop :: Connection -> IO ()
-recvLoop Connection{connRecv = Half{..}, ..} =
+recvLoop :: Connection r s -> IO HalfTerminator
+recvLoop Connection{connRecv = Half{..}, connBackend = Backend{..}} =
     loop
   where
     loop = do
-        -- Test if connection is closed, in case 'close' fails to kill us.
-        -- Shouldn't be necessary, but a silly 'backendClose' might swallow
-        -- 'ThreadKilled' and return successfully.
-        --
-        -- It's okay if we queue bytes after the connection is no longer in the
-        -- 'ConnOpen' state, as 'recv' and 'unRecv' call 'checkOpen'.
-        s <- readTVarIO connState
-        when (s /= ConnOpen) $ throwIO ThreadKilled
+        m <- backendRecv
+        case m of
+            Nothing -> return HTEOF
+            Just r -> do
+                res <- atomically $ Q.write queue r
+                case res of
+                    Left t   -> return t
+                    Right () -> loop
 
-        res <- try $ backendRecv connBackend
-        case res of
-            Left ex ->
-                  atomically $ writeTVar state $! RecvError ex
-            Right bs
-              | B.null bs ->
-                  atomically $ writeTVar state RecvClosed
-              | otherwise -> do
-                  atomically $ BQ.write queue bs
-                  loop
-
-sendLoop :: Connection -> IO ()
-sendLoop Connection{connSend = Half{..}, ..} =
+sendLoop :: Connection r s -> IO HalfTerminator
+sendLoop Connection{connSend = Half{..}, connBackend = Backend{..}} =
     loop
   where
     loop = do
-        bs <- atomically $ BQ.read queue `orElse` do
-                  -- Terminate if the queue is exhausted *and* the connection
-                  -- is being closed.
-                  s <- readTVar connState
-                  if s == ConnOpen then retry else throwSTM ThreadKilled
-
-        res <- try $ backendSend connBackend bs
+        res <- atomically $ Q.read queue
         case res of
-            Left ex -> atomically $ writeTVar state $! SendError ex
-            Right _ -> loop
+            Left t -> do
+                backendSend Nothing
+                return t
+            Right s -> do
+                backendSend $ Just s
+                loop
 
--- | Close the connection.  After this, 'recv', 'unRecv', and 'send' will fail.
+-- | Close the connection.  After this, 'recv' and 'send' will fail.
 --
 -- 'close' will block until all queued data has been sent and the connection
 -- has been closed.  If 'close' is interrupted, it will abandon any data still
 -- sitting in the send queue, and finish closing the connection in the
 -- background.
-close :: Connection -> IO ()
+close :: Connection r s -> IO ()
 close Connection{..} =
   mask_ $
   join $ atomically $ do
@@ -159,6 +129,8 @@ close Connection{..} =
     case s of
         ConnOpen -> do
             writeTVar connState ConnClosing
+            _ <- Q.close (queue connRecv) HTConnClosed
+            _ <- Q.close (queue connSend) HTConnClosed
             return $ do
                 killHalf connRecv
                 _ <- forkIOWithUnmask $ \unmask ->
@@ -179,101 +151,108 @@ close Connection{..} =
         if s == ConnClosed then return () else retry
     setClosed = atomically $ writeTVar connState ConnClosed
 
-waitHalf :: Half s -> IO ()
+waitHalf :: Half a -> IO ()
 waitHalf Half{..} =
   atomically $ do
     d <- readTVar done
     if d then return () else retry
 
-killHalf :: Half s -> IO ()
+killHalf :: Half a -> IO ()
 killHalf = void . forkIO . killThread . thread
 
-checkOpen :: Connection -> STM ()
-checkOpen Connection{..} = do
+checkOpen :: Connection r s -> String -> STM ()
+checkOpen Connection{..} loc = do
     s <- readTVar connState
-    when (s /= ConnOpen) $ throwSTM ErrorConnectionClosed
+    when (s /= ConnOpen) $ throwSTM $ ErrorConnectionClosed loc
 
--- | Receive the next chunk of bytes from the connection.
--- Return 'Nothing' on EOF, a non-empty string otherwise.  Throw an exception
--- if the 'Connection' is closed, or if the underlying 'backendRecv' failed.
+-- | Receive the next message from the connection.  Return 'Nothing' on EOF.
+-- Throw an exception if the 'Connection' is closed, or if the underlying
+-- 'backendRecv' failed.
 --
--- This will block if no bytes are available right now.
-recv :: Connection -> STM (Maybe ByteString)
-recv conn@Connection{connRecv = Half{..}, ..} = do
-    checkOpen conn
-    (Just <$> BQ.read queue) `orElse` do
-        -- Read from the queue *first*.  Don't report EOF or error until all
-        -- bytes in the queue are consumed.
-        s <- readTVar state
-        case s of
-            RecvOpen     -> retry
-            RecvClosed   -> return Nothing
-            RecvError ex -> throwSTM ex
+-- This will block if no messages are available right now.
+recv :: Connection r s -> STM (Maybe r)
+recv conn@Connection{connRecv = Half{..}} = do
+    checkOpen conn loc
+    res <- Q.read queue
+    case res of
+        Right r           -> return $ Just r
+        Left HTEOF        -> return Nothing
+        Left HTConnClosed -> throwSTM $ ErrorConnectionClosed loc
+        Left (HTError ex) -> throwSTM ex
+  where
+    loc = "recv"
 
--- | Put some bytes back.  These will be the next bytes returned by 'recv',
--- even if 'recv' previously reported EOF or error.
---
--- This will never block, but it will throw 'ErrorConnectionClosed' if the
--- connection is closed.
-unRecv :: Connection -> ByteString -> STM ()
-unRecv conn@Connection{..} bs = do
-    checkOpen conn
-    BQ.unRead (queue connRecv) bs
-
--- | Send a chunk of bytes on the connection.  Throw an exception if the
+-- | Send a message on the connection.  Throw an exception if the
 -- 'Connection' is closed, or if a /previous/ 'backendSend' failed.
 --
 -- This will block if the send queue is full.
-send :: Connection -> ByteString -> STM ()
-send conn bs = withSendQueue conn $ \q -> BQ.write q bs
+send :: Connection r s -> s -> STM ()
+send Connection{connSend = Half{..}} s = do
+    res <- Q.write queue s
+    case res of
+        Right ()          -> return ()
+        Left HTEOF        -> throwSTM $ ErrorSentClose loc
+        Left HTConnClosed -> throwSTM $ ErrorConnectionClosed loc
+        Left (HTError ex) -> throwSTM ex
+  where
+    loc = "send"
 
 -- | Like 'send', but never block, even if this causes the send queue to exceed
--- 'configSendMaxBytes'.
-sendCram :: Connection -> ByteString -> STM ()
-sendCram conn bs = withSendQueue conn $ \q -> BQ.cram q bs
+-- 'configSendLimit'.
+cram :: Connection r s -> s -> STM ()
+cram Connection{connSend = Half{..}} s = do
+    res <- Q.cram queue s
+    case res of
+        Right ()          -> return ()
+        Left HTEOF        -> throwSTM $ ErrorSentClose loc
+        Left HTConnClosed -> throwSTM $ ErrorConnectionClosed loc
+        Left (HTError ex) -> throwSTM ex
+  where
+    loc = "cram"
 
 -- | Test if the send queue is empty.  This is useful when sending dummy
 -- messages to keep the connection alive, to avoid queuing such messages when
 -- the connection is already congested with messages to send.
-isSendQueueEmpty :: Connection -> STM Bool
-isSendQueueEmpty conn = withSendQueue conn BQ.isEmpty
+isSendQueueEmpty :: Connection r s -> STM Bool
+isSendQueueEmpty conn@Connection{connSend = Half{..}} = do
+    checkOpen conn loc
+    Q.isEmpty queue
+  where
+    loc = "isSendQueueEmpty"
 
-withSendQueue :: Connection -> (ByteQueue -> STM a) -> STM a
-withSendQueue conn@Connection{connSend = Half{..}, ..} cb = do
-    checkOpen conn
-    s <- readTVar state
-    case s of
-        SendOpen     -> cb queue
-        SendError ex -> throwSTM ex
+-- | Shut down the connection for sending, but keep the connection open so
+-- more data can be received.  Subsequent calls to 'send' and 'cram'
+-- will fail.
+bye :: Connection r s -> STM ()
+bye Connection{connSend = Half{..}} = do
+    res <- Q.close queue HTEOF
+    case res of
+        Right ()          -> return ()
+        Left HTEOF        -> return ()
+        Left HTConnClosed -> throwSTM $ ErrorConnectionClosed loc
+        Left (HTError ex) -> throwSTM ex
+  where
+    loc = "bye"
 
 ------------------------------------------------------------------------
 -- Connection backends
 
-class HasBackend h where
-    -- | Create a 'Backend' for accessing this handle.
-    getBackend :: h -> IO Backend
-
-instance HasBackend Backend where
-    getBackend = return
-
-instance HasBackend Handle where
-    getBackend h = return $! Backend
-        { backendRecv  = B.hGetSome h 16384
-        , backendSend  = B.hPut h
-        , backendClose = hClose h
-        }
-
 -- |
 -- Connection I\/O driver.
 --
--- 'backendSend' and 'backendRecv' will often be called at the same time,
--- so they must not block each other.
-data Backend = Backend
-    { backendRecv :: !(IO ByteString)
-      -- ^ Receive the next chunk of bytes.  Return 'B.empty' on EOF.
-    , backendSend :: !(ByteString -> IO ())
-      -- ^ Send (and flush) the given bytes.  'backendSend' is never called
-      --   with an empty string.
+-- 'backendSend' and 'backendRecv' will often be called at the same time, so
+-- they must not block each other.  However, 'backendRecv' and 'backendSend'
+-- are each called in their own thread, so it is safe to use 'IORef's to
+-- marshal state from call to call.
+data Backend r s = Backend
+    { backendRecv :: !(IO (Maybe r))
+      -- ^ Receive the next message.  Return 'Nothing' on EOF.
+    , backendSend :: !(Maybe s -> IO ())
+      -- ^ Send (and flush) the given message.
+      --
+      --   If 'Nothing' is given, shut down the underlying connection for
+      --   sending, as 'backendSend' will not be called again.  If your device
+      --   does not support this, do nothing.
     , backendClose :: !(IO ())
       -- ^ Close the connection.  'backendSend' and 'backendRecv' are never
       --   called during or after this.
@@ -283,15 +262,19 @@ data Backend = Backend
 -- Configuration
 
 data Config = Config
-    { configRecvMaxBytes :: !Int
-      -- ^ Default: 16384
+    { configRecvLimit :: !(Maybe Int)
+      -- ^ Default: @'Just' 10@
       --
-      --   Number of bytes that may sit in the receive queue before the
-      --   receiving thread blocks.
-    , configSendMaxBytes :: !Int
-      -- ^ Default: 16384
+      --   Number of messages that may sit in the receive queue before the
+      --   'Connection''s receiving thread blocks.  Having a limit is
+      --   recommended in case the client produces messages faster than your
+      --   program consumes them.
+    , configSendLimit :: !(Maybe Int)
+      -- ^ Default: @'Just' 10@
       --
-      --   Number of bytes that may sit in the send queue before 'send' blocks.
+      --   Number of messages that may sit in the send queue before 'send'
+      --   blocks.  Having a limit is recommended if your program produces
+      --   messages faster than they can be sent.
     }
 
 instance Default Config where
@@ -299,19 +282,23 @@ instance Default Config where
 
 defaultConfig :: Config
 defaultConfig = Config
-    { configRecvMaxBytes = 16384
-    , configSendMaxBytes = 16384
+    { configRecvLimit = Just 10
+    , configSendLimit = Just 10
     }
 
 ------------------------------------------------------------------------
 -- Exceptions
 
-data ConnectionError
-  = ErrorConnectionClosed -- ^ connection 'close'd
+data Error
+  = ErrorConnectionClosed String
+    -- ^ connection 'close'd
+  | ErrorSentClose String
+    -- ^ connection shut down for sending
   deriving Typeable
 
-instance Show ConnectionError where
+instance Show Error where
     show err = case err of
-        ErrorConnectionClosed -> "connection closed"
+        ErrorConnectionClosed loc -> loc ++ ": connection closed"
+        ErrorSentClose        loc -> loc ++ ": connection shut down for sending"
 
-instance Exception ConnectionError
+instance Exception Error
