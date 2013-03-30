@@ -56,7 +56,6 @@ data Half a = Half
 
 data HalfTerminator
   = HTEOF
-  | HTConnClosed
   | HTError !SomeException
 
 -- | Wrap a connection handle so sending and receiving can be done with
@@ -129,8 +128,8 @@ close Connection{..} =
     case s of
         ConnOpen -> do
             writeTVar connState ConnClosing
-            _ <- Q.close (queue connRecv) HTConnClosed
-            _ <- Q.close (queue connSend) HTConnClosed
+            _ <- Q.close (queue connRecv) $ HTError $ toException ThreadKilled
+            _ <- Q.close (queue connSend) $ HTError $ toException ThreadKilled
             return $ do
                 killHalf connRecv
                 _ <- forkIOWithUnmask $ \unmask ->
@@ -177,7 +176,6 @@ recv conn@Connection{connRecv = Half{..}} = do
     case res of
         Right r           -> return $ Just r
         Left HTEOF        -> return Nothing
-        Left HTConnClosed -> throwSTM $ ErrorConnectionClosed loc
         Left (HTError ex) -> throwSTM ex
   where
     loc = "recv"
@@ -187,12 +185,12 @@ recv conn@Connection{connRecv = Half{..}} = do
 --
 -- This will block if the send queue is full.
 send :: Connection r s -> s -> STM ()
-send Connection{connSend = Half{..}} s = do
+send conn@Connection{connSend = Half{..}} s = do
+    checkOpen conn loc
     res <- Q.write queue s
     case res of
         Right ()          -> return ()
         Left HTEOF        -> throwSTM $ ErrorSentClose loc
-        Left HTConnClosed -> throwSTM $ ErrorConnectionClosed loc
         Left (HTError ex) -> throwSTM ex
   where
     loc = "send"
@@ -200,12 +198,12 @@ send Connection{connSend = Half{..}} s = do
 -- | Like 'send', but never block, even if this causes the send queue to exceed
 -- 'configSendLimit'.
 cram :: Connection r s -> s -> STM ()
-cram Connection{connSend = Half{..}} s = do
+cram conn@Connection{connSend = Half{..}} s = do
+    checkOpen conn loc
     res <- Q.cram queue s
     case res of
         Right ()          -> return ()
         Left HTEOF        -> throwSTM $ ErrorSentClose loc
-        Left HTConnClosed -> throwSTM $ ErrorConnectionClosed loc
         Left (HTError ex) -> throwSTM ex
   where
     loc = "cram"
@@ -224,12 +222,12 @@ isSendQueueEmpty conn@Connection{connSend = Half{..}} = do
 -- more data can be received.  Subsequent calls to 'send' and 'cram'
 -- will fail.
 bye :: Connection r s -> STM ()
-bye Connection{connSend = Half{..}} = do
+bye conn@Connection{connSend = Half{..}} = do
+    checkOpen conn loc
     res <- Q.close queue HTEOF
     case res of
         Right ()          -> return ()
         Left HTEOF        -> return ()
-        Left HTConnClosed -> throwSTM $ ErrorConnectionClosed loc
         Left (HTError ex) -> throwSTM ex
   where
     loc = "bye"
