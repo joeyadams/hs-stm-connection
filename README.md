@@ -1,0 +1,1 @@
+This library is experimental, and has not been released to Hackage yet.  See the [current Haddock documentation](http://joeyadams.github.com/hs-stm-connection/6a4b37c/Control-Concurrent-STM-Connection.html).
