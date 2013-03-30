@@ -54,8 +54,6 @@ whenOpen Queue{..} onOpen = do
 --
 -- If 'close' has already been called, return 'Left' with the old terminator
 -- value.  All of the 'Queue' accessors signal failure this way.
--- With the exception of 'read' and 'isEmpty', accessors will always return
--- 'Left' after 'close' has been called.
 close :: Queue t a -> t -> STM (Either t ())
 close q@Queue{..} t =
     whenOpen q $ writeTVar closed $ Just t
@@ -88,14 +86,10 @@ read q@Queue{..} = do
             dec count
             return $ Right a
 
--- | Return @'Right' 'True'@ if the queue is empty, meaning 'read' would block.
--- Return 'Left' if the queue is closed and no more items are left.
-isEmpty :: Queue t a -> STM (Either t Bool)
-isEmpty q@Queue{..} = do
-    e <- isEmptyTChan chan
-    if e
-        then whenOpen q $ return True
-        else return $ Right False
+-- | Return 'True' if the queue is empty, meaning 'read' would block.
+-- This ignores whether the queue is 'close'd.
+isEmpty :: Queue t a -> STM Bool
+isEmpty = isEmptyTChan . chan
 
 -- | Write an item to the queue.  Block if the queue is full.
 -- Return 'Left' if the queue is 'close'd.
