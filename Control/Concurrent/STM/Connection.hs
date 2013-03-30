@@ -240,8 +240,8 @@ bye conn@Connection{connSend = Half{..}} = do
 --
 -- 'backendSend' and 'backendRecv' will often be called at the same time, so
 -- they must not block each other.  However, 'backendRecv' and 'backendSend'
--- are each called in their own thread, so it is safe to use 'IORef's to
--- marshal state from call to call.
+-- are each called in their own thread, so it is safe to use
+-- 'Data.IORef.IORef's to marshal state from call to call.
 data Backend r s = Backend
     { backendRecv :: !(IO (Maybe r))
       -- ^ Receive the next message.  Return 'Nothing' on EOF.
@@ -252,7 +252,7 @@ data Backend r s = Backend
       --   sending, as 'backendSend' will not be called again.  If your device
       --   does not support this, do nothing.
     , backendClose :: !(IO ())
-      -- ^ Close the connection.  'backendSend' and 'backendRecv' are never
+      -- ^ Close the device.  'backendSend' and 'backendRecv' are never
       --   called during or after this.
     }
 
