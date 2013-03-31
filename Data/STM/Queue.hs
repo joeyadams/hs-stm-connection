@@ -5,7 +5,6 @@ module Data.STM.Queue (
     newIO,
     close,
     read,
-    isEmpty,
     write,
     cram,
 ) where
@@ -85,11 +84,6 @@ read q@Queue{..} = do
         Just a -> do
             dec count
             return $ Right a
-
--- | Return 'True' if the queue is empty, meaning 'read' would block.
--- This ignores whether the queue is 'close'd.
-isEmpty :: Queue t a -> STM Bool
-isEmpty = isEmptyTChan . chan
 
 -- | Write an item to the queue.  Block if the queue is full.
 -- Return 'Left' if the queue is 'close'd.

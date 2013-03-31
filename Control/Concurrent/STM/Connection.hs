@@ -9,7 +9,6 @@ module Control.Concurrent.STM.Connection (
     recv,
     send,
     cram,
-    isSendQueueEmpty,
     bye,
 
     -- * Connection backend
@@ -223,16 +222,6 @@ cram conn@Connection{connSend = Half{..}} s = do
         Left (HTError ex) -> throwSTM ex
   where
     loc = "cram"
-
--- | Test if the send queue is empty.  This is useful when sending dummy
--- messages to keep the connection alive, to avoid queuing such messages when
--- the connection is already congested with messages to send.
-isSendQueueEmpty :: Connection r s -> STM Bool
-isSendQueueEmpty conn@Connection{connSend = Half{..}} = do
-    checkOpen conn loc
-    Q.isEmpty queue
-  where
-    loc = "isSendQueueEmpty"
 
 -- | Shut down the connection for sending, but keep the connection open so
 -- more data can be received.  Subsequent calls to 'send' and 'cram'
